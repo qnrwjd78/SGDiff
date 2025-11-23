@@ -18,6 +18,7 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention import SpatialTransformer
+from ldm.modules.global_film import FiLMGenerator
 
 
 # dummy replace
@@ -467,6 +468,8 @@ class UNetModel(nn.Module):
         context_dim=None,                 # custom transformer support
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
+        film_embedding_dim=None,
+        lora_rank: int = 0,
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -503,6 +506,7 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
+        self.lora_rank = lora_rank
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -514,9 +518,19 @@ class UNetModel(nn.Module):
         self.context_local_mlp = nn.Sequential(
             linear(context_local_dim, context_dim)
         )
+        self.film_generator = FiLMGenerator(film_embedding_dim, hidden_dim=model_channels * 2) if film_embedding_dim is not None else None
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+
+        if self.film_generator is not None:
+            # Pre-register channel sizes encountered in UNet
+            film_channels = set([model_channels])
+            for mult in channel_mult:
+                film_channels.add(mult * model_channels)
+                film_channels.add(mult * model_channels * 2)
+            for ch_size in film_channels:
+                self.film_generator.register_channel(ch_size)
 
         self.input_blocks = nn.ModuleList(
             [
@@ -560,7 +574,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, lora_rank=self.lora_rank
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -615,7 +629,7 @@ class UNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, lora_rank=self.lora_rank
                         ),
             ResBlock(
                 ch,
@@ -627,6 +641,15 @@ class UNetModel(nn.Module):
             ),
         )
         self._feature_size += ch
+
+    def apply_film(self, x, film_cond):
+        if self.film_generator is None or film_cond is None:
+            return x
+        gamma, beta = self.film_generator(film_cond, x.shape[1])
+        while gamma.dim() < x.dim():
+            gamma = gamma.unsqueeze(-1)
+            beta = beta.unsqueeze(-1)
+        return x * (1 + gamma) + beta
 
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
@@ -661,7 +684,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, lora_rank=self.lora_rank
                         )
                     )
                 if level and i == num_res_blocks:
@@ -712,7 +735,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, c_local=None, c_global=None):
+    def forward(self, x, timesteps=None, c_local=None, c_global=None, film_cond=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -727,15 +750,21 @@ class UNetModel(nn.Module):
 
         context_local = self.context_local_mlp(c_local)
         context = th.cat([context_local, c_global], dim=1)
+        if film_cond is None:
+            film_cond = c_global.mean(dim=1) if c_global is not None else None
 
         h = x.type(self.dtype)
+        h = self.apply_film(h, film_cond)
         for module in self.input_blocks:
             h = module(h, emb, context)
+            h = self.apply_film(h, film_cond)
             hs.append(h)
         h = self.middle_block(h, emb, context)
+        h = self.apply_film(h, film_cond)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context)
+            h = self.apply_film(h, film_cond)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)

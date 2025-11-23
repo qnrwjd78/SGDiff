@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 1.0e-06
+  base_learning_rate: 5.0e-05
   target: ldm.models.diffusion.ddpm.LatentDiffusion
   params:
     linear_start: 0.0015
@@ -11,10 +11,11 @@ model:
     cond_stage_key: class_label
     image_size: 32
     channels: 4
-    cond_stage_trainable: false
+    cond_stage_trainable: true
     conditioning_key: crossattn
-    cond_stage_forward: encode_graph_local_global
     monitor: val/loss_simple_ema
+    freeze_unet: true
+    freeze_first_stage: true
     unet_config:
       target: ldm.modules.diffusionmodules.openaimodel.UNetModel
       params:
@@ -34,8 +35,10 @@ model:
         num_head_channels: 32
         use_spatial_transformer: true
         transformer_depth: 1
-        context_local_dim: 1536
+        context_local_dim: 512
         context_dim: 512
+        film_embedding_dim: 512
+        lora_rank: 4
     first_stage_config:
       target: ldm.models.autoencoder.VQModelInterface
       params:
@@ -61,14 +64,20 @@ model:
         lossconfig:
           target: torch.nn.Identity
     cond_stage_config:
-      target: ldm.modules.cgip.cgip.CGIPModel
+      target: ldm.modules.nsg_encoder.NSGEncoder
       params:
         num_objs: 179
         num_preds: 46
-        layers: 5
-        width: 512
-        embed_dim: 512
-        ckpt_path: pretrained/sip_vg.pt
+        dim: 512
+        depth: 4
+        heads: 8
+        max_tokens: 64
+    global_stage_config:
+      target: ldm.modules.global_film.CLIPGlobalEncoder
+      params:
+        model_name: ViT-B/32
+        device: cuda
+        normalize: true
 data:
   target: scripts.datamodule.DataModuleFromConfig
   params:

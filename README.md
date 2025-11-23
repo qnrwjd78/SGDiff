@@ -1,71 +1,73 @@
-# Diffusion-Based Scene Graph to Image Generation with Masked Contrastive Pre-Training
-<a href="https://arxiv.org/abs/2211.11138"><img src="https://img.shields.io/badge/arXiv-2211.11138-blue.svg" height=22.5></a>
+# Scene-Graph Guided Latent Editing (NSG + CLIP FiLM + Inversion)
 
-Official Implementation for [Diffusion-Based Scene Graph to Image Generation with Masked Contrastive Pre-Training](https://arxiv.org/abs/2211.11138). 
+이 레포는 SGDiff를 **“Local: Scene Graph / Global: Reference Image”** 편집 파이프라인으로 재구성했습니다.
 
-🚩 New Updates : We release [LAION-SG](https://arxiv.org/abs/2412.08580), [a large-scale dataset](https://huggingface.co/datasets/mengcy/LAION-SG) with high-quality structural annotations of scene graphs (SG), which precisely describe attributes and relationships of multiple objects, effectively representing the semantic structure in complex scenes. Based on LAION-SG, we also provide a new foundation model [SDXL-SG](https://drive.google.com/file/d/1mdC3Np4KkV9V24K1gcyddsG5AIv5S0MT/view?usp=sharing) to incorporate structural annotation information into the generation process.
-## Overview of The Proposed SGDiff
+- Local (무엇·어디): Scene Graph → **NSG Encoder** → local tokens → U-Net cross-attn K,V  
+- Global (어떻게 보일지): Reference image → **CLIP image encoder** → **FiLM**(γ, β) → U-Net feature modulation  
+- LDM은 **DDIM inversion 기반 editing**에 사용. VAE/UNet/CLIP은 freeze, 학습 파라미터는 NSG + FiLM(+LoRA)만 엽니다.
 
-<div align=center><img width="850" alt="image" src="https://user-images.githubusercontent.com/62683396/202852210-d91d6a63-f04d-4a02-ae5f-55f00f8c1ec5.png"></div>
+## 변경 요약
+- `ldm/modules/nsg_encoder.py`: Transformer 기반 NSG encoder (scene graph → local tokens).
+- `ldm/modules/global_film.py`: CLIP image encoder(동결) + FiLM generator.
+- `ldm/modules/diffusionmodules/openaimodel.py`: FiLM 적용, LoRA(rank 선택) 지원, cross-attn에 NSG local tokens 사용.
+- `config_{vg,coco}.yaml`: cond stage = NSG, global stage = CLIP FiLM, UNet freeze+LoRA 옵션.
 
-
-
-
-## Environment
-```
+## 환경 (Linux 기준)
+```bash
 git clone https://github.com/YangLing0818/SGDiff.git
 cd SGDiff
-
 conda env create -f sgdiff.yaml
 conda activate sgdiff
-mkdir pretrained
+mkdir -p pretrained
+# CLIP (openai) 라이브러리가 없으면 설치
+pip install git+https://github.com/openai/CLIP.git
 ```
 
+필수 패키지: `pytorch==1.12.1`(CUDA 11.3), `pytorch-lightning==1.4.2`, `clip`(openai), `einops`, `omegaconf` 등. `sgdiff.yaml`에 포함되어 있습니다.
 
-## Data and Model Preparation
+## 필요한 파일 (수동 다운로드)
+- **VQ-VAE (first stage)**: https://ommer-lab.com/files/latent-diffusion/vq-f8.zip  
+  압축 풀어서 `pretrained/vq-f8-model.ckpt` 위치.
+- **데이터**: VG/COCO scene graph 전처리는 `DATA.md` 참고. 이미지/어노테이션 경로는 `config_vg.yaml`/`config_coco.yaml`에서 수정.
+- **CLIP**: openai `ViT-B/32`가 자동 다운로드(인터넷 필요). 오프라인이면 사전 캐시된 CLIP 가중치를 `$HOME/.cache/clip`에 두면 됩니다.
 
-The instructions of data pre-processing can be [found here](https://github.com/YangLing0818/SGDiff/blob/main/DATA.md).
+## 모델 설정 (핵심)
+- **동결(freeze)**: VAE, UNet 본체, CLIP.  
+- **학습(train)**: NSG encoder, FiLM MLP, LoRA(rank=4, cross-attn 선형층).
+- **Local cond**: NSG local tokens (`dim=512`, `max_tokens=64`) → UNet cross-attn K,V.
+- **Global cond**: CLIP image embedding (`dim=512`) → FiLM(γ,β) per block 채널.
+- **Inversion-friendly**: DDIM/forward diffusion으로 `z_T`를 만들고, 역확산 시 SG/FiLM 조건만 바꿔 편집.
 
-Our masked contrastive pre-trained models of SG-image pairs for COCO and VG datasets are provided in [here](https://www.dropbox.com/scl/fo/lccvtxuwxxblo3atnxlmg/h?rlkey=duy7dcwmy3a64auqoqiw8dv2e&dl=0), please download them and put them in the 'pretrained' directory.
+## 학습 실행 예시
+```bash
+# VG
+python trainer.py --base config_vg.yaml -t --gpus 0,
 
-And the pretrained VQVAE for embedding image to latent can be obtained from https://ommer-lab.com/files/latent-diffusion/vq-f8.zip
-
-## Masked Contrastive Pre-Training
-
-The instructions of SG-image pretraining can be found in the folder "sg_image_pretraining/"
-
-## Diffusion Training
-Kindly note that one **should not skip the training stage** and test directly. For single gpu, one can use
-```shell
-python trainer.py --base CONFIG_PATH -t --gpus 0,
+# COCO
+python trainer.py --base config_coco.yaml -t --gpus 0,
 ```
+주요 설정(`config_vg.yaml` 예):
+- `cond_stage_config`: `ldm.modules.nsg_encoder.NSGEncoder` (num_objs/preds 맞춰 수정).
+- `global_stage_config`: `ldm.modules.global_film.CLIPGlobalEncoder` (모델명, device).
+- `unet_config.params.film_embedding_dim=512`, `lora_rank=4`, `freeze_unet=true`, `freeze_first_stage=true`.
+- `base_learning_rate`는 NSG/FiLM/LoRA만 학습하도록 5e-5로 상향.
 
-***NOT OFFICIAL:***
-Alternatively, if you don't want to train the model from scratch you can download trained weights from the following link:
-[VG weight](https://drive.google.com/file/d/1bzYgv_lmCUL7wrh9G3t3169ITbAuMbYo/view?usp=sharing), [COCO weight](https://drive.google.com/file/d/1HAj2C3xHTrm-txVCq_cSSbr5NvFPnasR/view?usp=sharing) 
+## 데이터 입출력 포맷
+데이터로더(VG/COCO)는 `(image, objs, boxes, triples, obj_to_img, triple_to_img)`를 반환합니다.
+- **Local**: `(objs, boxes, triples, obj_to_img, triple_to_img)` → NSG encoder → `c_local`.
+- **Global**: `image` → CLIP image encoder → `h_global` → FiLM(γ,β) & `c_global`(1 token) for cross-attn.
+- **Latents**: image → VAE encoder → `z0`. 학습 시 표준 DDPM loss(MSE on noise).
 
-Checkpoint trained for only 150 epochs.
+## 편집(Inversion) 워크플로우 개요
+1) 원본 이미지 `x_ref` → VAE encoder → `z0`.  
+2) DDIM forward(or inversion) → `z_T`.  
+3) 변경된 scene graph → NSG → `c_local'`; reference image → CLIP → FiLM(γ,β).  
+4) 역확산(`z_T -> z_hat0`)에서 조건만 교체 → VAE decoder → 편집 결과.
 
-## Sampling
+현 레포에는 학습 루프만 포함됩니다. 서버에서 테스트할 때는 DDIM inversion 샘플러를 추가로 작성하거나 기존 `testset_ddim_sampler.py`를 참고해 위 과정을 구현하세요.
 
-```shell
-python testset_ddim_sampler.py
-```
-
-## Citation
-If you found the codes are useful, please cite our paper
-```
-@article{yang2022diffusionsg,
-  title={Diffusion-based scene graph to image generation with masked contrastive pre-training},
-  author={Yang, Ling and Huang, Zhilin and Song, Yang and Hong, Shenda and Li, Guohao and Zhang, Wentao and Cui, Bin and Ghanem, Bernard and Yang, Ming-Hsuan},
-  journal={arXiv preprint arXiv:2211.11138},
-  year={2022}
-}
-
-@article{li2024laion,
-  title={LAION-SG: An Enhanced Large-Scale Dataset for Training Complex Image-Text Models with Structural Annotations},
-  author={Li, Zejian and Meng, Chenye and Li, Yize and Yang, Ling and Zhang, Shengyuan and Ma, Jiarui and Li, Jiayi and Yang, Guang and Yang, Changyuan and Yang, Zhiyuan and others},
-  journal={arXiv preprint arXiv:2412.08580},
-  year={2024}
-}
-```
+## 정리
+- Local: Scene Graph → NSG → cross-attn  
+- Global: Reference image → CLIP → FiLM  
+- Freeze: VAE/UNet/CLIP, Train: NSG + FiLM(+LoRA)  
+- Config와 경로만 맞추면 바로 학습 가능합니다.

@@ -405,6 +405,9 @@ class LatentDiffusion(DDPM):
                  conditioning_key=None,
                  scale_factor=1.0,
                  scale_by_std=False,
+                 global_stage_config=None,
+                 freeze_unet=False,
+                 freeze_first_stage=False,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -419,6 +422,8 @@ class LatentDiffusion(DDPM):
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
+        self.freeze_unet = freeze_unet
+        self.freeze_first_stage_flag = freeze_first_stage
         try:
             self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
         except:
@@ -429,6 +434,17 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', torch.tensor(scale_factor))
         self.instantiate_first_stage(first_stage_config)
         self.instantiate_cond_stage(cond_stage_config)
+        self.global_stage_model = instantiate_from_config(global_stage_config) if global_stage_config is not None else None
+        if self.global_stage_model is not None:
+            self.global_stage_model.eval()
+            for p in self.global_stage_model.parameters():
+                p.requires_grad = False
+        if self.freeze_unet:
+            for name, param in self.model.named_parameters():
+                if ("film_generator" in name) or ("lora" in name):
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None
@@ -472,9 +488,10 @@ class LatentDiffusion(DDPM):
     def instantiate_first_stage(self, config):
         model = instantiate_from_config(config)
         self.first_stage_model = model.eval()
-        self.first_stage_model.train = disabled_train
-        for param in self.first_stage_model.parameters():
-            param.requires_grad = False
+        if self.freeze_first_stage_flag:
+            self.first_stage_model.train = disabled_train
+            for param in self.first_stage_model.parameters():
+                param.requires_grad = False
 
     def instantiate_cond_stage(self, config):
         if not self.cond_stage_trainable:
@@ -518,11 +535,8 @@ class LatentDiffusion(DDPM):
         return self.scale_factor * z
 
     def get_learned_conditioning(self, c):
-        c_local, c_global = self.cond_stage_model.encode_graph_local_global(c)
-        c_local = c_local.detach()
-        c_global = c_global.unsqueeze(1).detach()
-        c = {'c_local': c_local, 'c_global': c_global}
-        return c
+        c_local = self.cond_stage_model(c)
+        return {'c_local': c_local}
 
     def meshgrid(self, h, w):
         y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
@@ -615,13 +629,17 @@ class LatentDiffusion(DDPM):
             assert len(inputs) == 7
             all_imgs, all_ori_imgs, all_objs, all_boxes, all_triples, all_obj_to_img, all_triple_to_img = [x.to(self.device) for x in inputs]
         x = all_imgs
+        ref_img = all_ori_imgs if len(inputs) == 7 else all_imgs
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
-        graph_info = [all_imgs, all_objs, all_boxes, all_triples, all_obj_to_img, all_triple_to_img]
-        c = self.get_learned_conditioning(graph_info)
+        graph_info = (all_objs, all_boxes, all_triples, all_obj_to_img, all_triple_to_img)
+        c_local = self.get_learned_conditioning(graph_info)['c_local']
+        global_embed = self.global_stage_model(ref_img).detach() if self.global_stage_model is not None else None
+        c_global = global_embed.unsqueeze(1) if global_embed is not None else None
+        cond = {'c_local': c_local, 'c_global': c_global, 'film_cond': global_embed}
 
-        out = [z, c]
+        out = [z, cond]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
@@ -676,93 +694,9 @@ class LatentDiffusion(DDPM):
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
-
-        if isinstance(cond, dict):
-            pass
-        else:
-            if not isinstance(cond, list):
-                cond = [cond]
-            key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
-            cond = {key: cond}
-
-        if hasattr(self, "split_input_params"):
-            assert len(cond) == 1
-            assert not return_ids
-            ks = self.split_input_params["ks"]
-            stride = self.split_input_params["stride"]
-
-            h, w = x_noisy.shape[-2:]
-
-            fold, unfold, normalization, weighting = self.get_fold_unfold(x_noisy, ks, stride)
-
-            z = unfold(x_noisy)
-            z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))
-            z_list = [z[:, :, :, :, i] for i in range(z.shape[-1])]
-
-            if self.cond_stage_key in ["image", "LR_image", "segmentation",
-                                       'bbox_img'] and self.model.conditioning_key:
-                c_key = next(iter(cond.keys()))
-                c = next(iter(cond.values()))
-                assert (len(c) == 1)
-                c = c[0]
-
-                c = unfold(c)
-                c = c.view((c.shape[0], -1, ks[0], ks[1], c.shape[-1]))
-
-                cond_list = [{c_key: [c[:, :, :, :, i]]} for i in range(c.shape[-1])]
-
-            elif self.cond_stage_key == 'coordinates_bbox':
-                assert 'original_image_size' in self.split_input_params, 'BoudingBoxRescaling is missing original_image_size'
-
-                n_patches_per_row = int((w - ks[0]) / stride[0] + 1)
-                full_img_h, full_img_w = self.split_input_params['original_image_size']
-                num_downs = self.first_stage_model.encoder.num_resolutions - 1
-                rescale_latent = 2 ** (num_downs)
-
-                tl_patch_coordinates = [(rescale_latent * stride[0] * (patch_nr % n_patches_per_row) / full_img_w,
-                                         rescale_latent * stride[1] * (patch_nr // n_patches_per_row) / full_img_h)
-                                        for patch_nr in range(z.shape[-1])]
-
-                patch_limits = [(x_tl, y_tl,
-                                 rescale_latent * ks[0] / full_img_w,
-                                 rescale_latent * ks[1] / full_img_h) for x_tl, y_tl in tl_patch_coordinates]
-
-                patch_limits_tknzd = [torch.LongTensor(self.bbox_tokenizer._crop_encoder(bbox))[None].to(self.device)
-                                      for bbox in patch_limits]
-                print(patch_limits_tknzd[0].shape)
-
-                assert isinstance(cond, dict), 'cond must be dict to be fed into model'
-                cut_cond = cond['c_crossattn'][0][..., :-2].to(self.device)
-                print(cut_cond.shape)
-
-                adapted_cond = torch.stack([torch.cat([cut_cond, p], dim=1) for p in patch_limits_tknzd])
-                adapted_cond = rearrange(adapted_cond, 'l b n -> (l b) n')
-                print(adapted_cond.shape)
-                adapted_cond = self.get_learned_conditioning(adapted_cond)
-                print(adapted_cond.shape)
-                adapted_cond = rearrange(adapted_cond, '(l b) n d -> l b n d', l=z.shape[-1])
-                print(adapted_cond.shape)
-
-                cond_list = [{'c_crossattn': [e]} for e in adapted_cond]
-
-            else:
-                cond_list = [cond for i in range(z.shape[-1])]
-
-            # apply model by loop over crops
-            output_list = [self.model(z_list[i], t, **cond_list[i]) for i in range(z.shape[-1])]
-            assert not isinstance(output_list[0],
-                                  tuple)
-
-            o = torch.stack(output_list, axis=-1)
-            o = o * weighting
-            # Reverse reshape to img shape
-            o = o.view((o.shape[0], -1, o.shape[-1]))  # (bn, nc * ks[0] * ks[1], L)
-            # stitch crops together
-            x_recon = fold(o) / normalization
-
-        else:
-            x_recon = self.model(x_noisy, t, **cond)
-
+        if not isinstance(cond, dict):
+            raise ValueError("Expected conditioning dict with keys c_local/c_global/film_cond")
+        x_recon = self.model(x_noisy, t, **cond)
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
         else:
@@ -1256,8 +1190,8 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, c_local=None, c_global=None):
+    def forward(self, x, t, c_local=None, c_global=None, film_cond=None):
 
-        out = self.diffusion_model(x, t, c_local=c_local, c_global=c_global)
+        out = self.diffusion_model(x, t, c_local=c_local, c_global=c_global, film_cond=film_cond)
 
         return out
